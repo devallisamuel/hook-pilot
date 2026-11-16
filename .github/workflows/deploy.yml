@@ -1,0 +1,87 @@
+name: Deploy to AWS
+
+# Manual deploy: builds the image, pushes it to the ECR repository created by
+# Terraform, then applies Terraform with that image tag (rolling ECS deploy).
+#
+# One-time setup (see infra/terraform/README.md):
+#   - repository secret AWS_DEPLOY_ROLE_ARN: IAM role trusted for GitHub OIDC
+#   - repository variables AWS_REGION and TF_STATE_BUCKET
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [staging, production]
+        default: staging
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TF_IN_AUTOMATION: "true"
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform init
+        run: >-
+          terraform init
+          -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          -backend-config="key=hook-pilot/${{ inputs.environment }}.tfstate"
+          -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Create ECR repository (first deploy)
+        run: >-
+          terraform apply -auto-approve -input=false
+          -var-file=environments/${{ inputs.environment }}.tfvars
+          -target=aws_ecr_repository.app
+
+      - id: ecr
+        name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        working-directory: .
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/hook-pilot-${{ inputs.environment }}:${GITHUB_SHA::12}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE_TAG=${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
+      - name: Terraform apply
+        run: >-
+          terraform apply -auto-approve -input=false
+          -var-file=environments/${{ inputs.environment }}.tfvars
+          -var="image_tag=${IMAGE_TAG}"
+
+      - name: Smoke test
+        run: |
+          URL="$(terraform output -raw api_url)"
+          for i in $(seq 1 30); do
+            curl -fsS "$URL/health" && exit 0
+            sleep 10
+          done
+          echo "API did not become healthy at $URL" >&2
+          exit 1
